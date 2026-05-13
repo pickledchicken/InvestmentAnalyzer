@@ -14,19 +14,27 @@ app.use(cors({
   origin: ALLOWED_ORIGIN === "*" ? "*" : ALLOWED_ORIGIN
 }));
 
-function safeNumber(value) {
+function num(value) {
   if (value === null || value === undefined || value === "" || Number.isNaN(Number(value))) return null;
   return Number(value);
 }
 
+function firstNumber(...values) {
+  for (const value of values) {
+    const n = num(value);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
 function passFail(value, testFn) {
-  const num = safeNumber(value);
-  if (num === null) return { pass: null, label: "N/A" };
-  return testFn(num) ? { pass: true, label: "YES" } : { pass: false, label: "NO" };
+  const n = num(value);
+  if (n === null) return { pass: null, label: "N/A" };
+  return testFn(n) ? { pass: true, label: "YES" } : { pass: false, label: "NO" };
 }
 
 function average(values) {
-  const nums = values.map(safeNumber).filter(v => v !== null);
+  const nums = values.map(num).filter(v => v !== null);
   if (!nums.length) return null;
   return nums.reduce((sum, v) => sum + v, 0) / nums.length;
 }
@@ -34,7 +42,6 @@ function average(values) {
 function recommendationFromScore(score, totalApplicable) {
   if (totalApplicable === 0) return "Not enough data";
   const pct = score / totalApplicable;
-
   if (pct >= 0.9) return "Strong Buy Candidate";
   if (pct >= 0.75) return "Good Candidate";
   if (pct >= 0.55) return "Moderate / Needs More Analysis";
@@ -42,14 +49,99 @@ function recommendationFromScore(score, totalApplicable) {
   return "Weak Fundamentals";
 }
 
-function buildDecision(symbol, profile, ratiosTtm, keyMetricsTtm, growthAnnual, ratiosAnnual) {
-  const revenueGrowth = safeNumber(growthAnnual?.revenueGrowth);
-  const peRatio = safeNumber(ratiosTtm?.priceEarningsRatioTTM ?? keyMetricsTtm?.peRatioTTM);
-  const pegRatio = safeNumber(keyMetricsTtm?.pegRatioTTM ?? ratiosTtm?.priceEarningsToGrowthRatioTTM);
-  const quickRatio = safeNumber(ratiosTtm?.quickRatioTTM);
+async function fmp(path) {
+  if (!FMP_API_KEY) {
+    throw new Error("Missing FMP_API_KEY. Add it in Render Environment Variables.");
+  }
+
+  const separator = path.includes("?") ? "&" : "?";
+  const url = `https://financialmodelingprep.com/stable/${path}${separator}apikey=${FMP_API_KEY}`;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Financial Modeling Prep request failed: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function calculateRevenueGrowth(incomeStatements) {
+  if (!Array.isArray(incomeStatements) || incomeStatements.length < 2) return null;
+
+  const latestRevenue = num(incomeStatements[0]?.revenue);
+  const priorRevenue = num(incomeStatements[1]?.revenue);
+
+  if (latestRevenue === null || priorRevenue === null || priorRevenue === 0) return null;
+
+  return (latestRevenue - priorRevenue) / priorRevenue;
+}
+
+function calculatePeRatio(price, incomeStatements) {
+  const eps = firstNumber(
+    incomeStatements?.[0]?.eps,
+    incomeStatements?.[0]?.epsdiluted,
+    incomeStatements?.[0]?.weightedAverageShsOutDil
+  );
+
+  const p = num(price);
+
+  if (p === null) return null;
+
+  const epsValue = firstNumber(incomeStatements?.[0]?.eps, incomeStatements?.[0]?.epsdiluted);
+
+  if (epsValue === null || epsValue <= 0) return null;
+
+  return p / epsValue;
+}
+
+function calculatePegRatio(peRatio, incomeStatements) {
+  if (!Array.isArray(incomeStatements) || incomeStatements.length < 3) return null;
+
+  const latestEps = firstNumber(incomeStatements[0]?.eps, incomeStatements[0]?.epsdiluted);
+  const oldEps = firstNumber(incomeStatements[2]?.eps, incomeStatements[2]?.epsdiluted);
+
+  if (latestEps === null || oldEps === null || oldEps <= 0 || latestEps <= 0 || peRatio === null) return null;
+
+  const years = 2;
+  const epsCagr = Math.pow(latestEps / oldEps, 1 / years) - 1;
+
+  if (epsCagr <= 0) return null;
+
+  return peRatio / (epsCagr * 100);
+}
+
+function buildDecision(symbol, profile, ratiosTtm, keyMetricsTtm, incomeStatements, ratiosAnnual) {
+  const price = firstNumber(profile?.price, profile?.price);
+
+  const revenueGrowth = firstNumber(
+    incomeStatements?.[0]?.revenueGrowth,
+    calculateRevenueGrowth(incomeStatements)
+  );
+
+  const peRatio = firstNumber(
+    ratiosTtm?.priceEarningsRatioTTM,
+    ratiosTtm?.peRatioTTM,
+    keyMetricsTtm?.peRatioTTM,
+    keyMetricsTtm?.peRatio,
+    calculatePeRatio(price, incomeStatements)
+  );
+
+  const pegRatio = firstNumber(
+    keyMetricsTtm?.pegRatioTTM,
+    keyMetricsTtm?.pegRatio,
+    ratiosTtm?.priceEarningsToGrowthRatioTTM,
+    calculatePegRatio(peRatio, incomeStatements)
+  );
+
+  const quickRatio = firstNumber(
+    ratiosTtm?.quickRatioTTM,
+    ratiosTtm?.quickRatio
+  );
 
   const annualRoes = Array.isArray(ratiosAnnual)
-    ? ratiosAnnual.slice(0, 5).map(row => row.returnOnEquity)
+    ? ratiosAnnual.slice(0, 5).map(row =>
+        firstNumber(row.returnOnEquity, row.returnOnEquityRatio, row.roe)
+      )
     : [];
 
   const avgRoe5Y = average(annualRoes);
@@ -93,9 +185,9 @@ function buildDecision(symbol, profile, ratiosTtm, keyMetricsTtm, growthAnnual, 
 
   return {
     symbol,
-    companyName: profile?.companyName || profile?.companyName || profile?.name || "",
+    companyName: profile?.companyName || profile?.name || "",
     type: profile?.type || profile?.sector || "",
-    price: safeNumber(profile?.price),
+    price,
     metrics: {
       revenueGrowth,
       peRatio,
@@ -109,22 +201,6 @@ function buildDecision(symbol, profile, ratiosTtm, keyMetricsTtm, growthAnnual, 
     recommendation: recommendationFromScore(score, totalApplicable),
     notes
   };
-}
-
-async function fmp(path) {
-  if (!FMP_API_KEY) {
-    throw new Error("Missing FMP_API_KEY. Add it in Render Environment Variables.");
-  }
-
-  const separator = path.includes("?") ? "&" : "?";
-  const url = `https://financialmodelingprep.com/stable/${path}${separator}apikey=${FMP_API_KEY}`;
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`Financial Modeling Prep request failed: ${response.status}`);
-  }
-
-  return response.json();
 }
 
 app.get("/", (req, res) => {
@@ -146,27 +222,27 @@ app.get("/api/analyze/:symbol", async (req, res) => {
       profileData,
       ratiosTtmData,
       keyMetricsTtmData,
-      growthAnnualData,
+      incomeStatementData,
       ratiosAnnualData
     ] = await Promise.all([
       fmp(`profile?symbol=${symbol}`),
       fmp(`ratios-ttm?symbol=${symbol}`),
       fmp(`key-metrics-ttm?symbol=${symbol}`),
-      fmp(`income-statement-growth?symbol=${symbol}&period=annual&limit=1`),
+      fmp(`income-statement?symbol=${symbol}&period=annual&limit=5`),
       fmp(`ratios?symbol=${symbol}&period=annual&limit=5`)
     ]);
 
     const profile = Array.isArray(profileData) ? profileData[0] : profileData;
     const ratiosTtm = Array.isArray(ratiosTtmData) ? ratiosTtmData[0] : ratiosTtmData;
     const keyMetricsTtm = Array.isArray(keyMetricsTtmData) ? keyMetricsTtmData[0] : keyMetricsTtmData;
-    const growthAnnual = Array.isArray(growthAnnualData) ? growthAnnualData[0] : growthAnnualData;
+    const incomeStatements = Array.isArray(incomeStatementData) ? incomeStatementData : [];
     const ratiosAnnual = Array.isArray(ratiosAnnualData) ? ratiosAnnualData : [];
 
-    if (!profile && !ratiosTtm && !keyMetricsTtm) {
+    if (!profile && !ratiosTtm && !keyMetricsTtm && incomeStatements.length === 0) {
       return res.status(404).json({ error: "No source data found for that ticker." });
     }
 
-    res.json(buildDecision(symbol, profile, ratiosTtm, keyMetricsTtm, growthAnnual, ratiosAnnual));
+    res.json(buildDecision(symbol, profile, ratiosTtm, keyMetricsTtm, incomeStatements, ratiosAnnual));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message || "Unable to analyze ticker." });
