@@ -10,9 +10,16 @@ const PORT = process.env.PORT || 3000;
 const ALPHA_VANTAGE_API_KEY = process.env.ALPHA_VANTAGE_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
+const cache = new Map();
+const CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+
 app.use(cors({
   origin: ALLOWED_ORIGIN === "*" ? "*" : ALLOWED_ORIGIN
 }));
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function num(value) {
   if (
@@ -83,7 +90,7 @@ async function alphaVantage(params) {
   const data = await response.json();
 
   if (data.Note) {
-    throw new Error("Alpha Vantage rate limit reached. Try again later or reduce searches.");
+    throw new Error(data.Note);
   }
 
   if (data.Information) {
@@ -248,18 +255,53 @@ app.get("/api/analyze/:symbol", async (req, res) => {
       return res.status(400).json({ error: "Invalid ticker symbol." });
     }
 
-    const [overview, quote, incomeStatement, balanceSheet] = await Promise.all([
-      alphaVantage({ function: "OVERVIEW", symbol }),
-      alphaVantage({ function: "GLOBAL_QUOTE", symbol }),
-      alphaVantage({ function: "INCOME_STATEMENT", symbol }),
-      alphaVantage({ function: "BALANCE_SHEET", symbol })
-    ]);
+    const cached = cache.get(symbol);
+
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return res.json({
+        ...cached.data,
+        cached: true
+      });
+    }
+
+    const overview = await alphaVantage({
+      function: "OVERVIEW",
+      symbol
+    });
+
+    await sleep(1200);
+
+    const quote = await alphaVantage({
+      function: "GLOBAL_QUOTE",
+      symbol
+    });
+
+    await sleep(1200);
+
+    const incomeStatement = await alphaVantage({
+      function: "INCOME_STATEMENT",
+      symbol
+    });
+
+    await sleep(1200);
+
+    const balanceSheet = await alphaVantage({
+      function: "BALANCE_SHEET",
+      symbol
+    });
 
     if (!overview || Object.keys(overview).length === 0) {
       return res.status(404).json({ error: "No Alpha Vantage data found for that ticker." });
     }
 
-    res.json(buildDecision(symbol, overview, quote, incomeStatement, balanceSheet));
+    const decision = buildDecision(symbol, overview, quote, incomeStatement, balanceSheet);
+
+    cache.set(symbol, {
+      timestamp: Date.now(),
+      data: decision
+    });
+
+    res.json(decision);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message || "Unable to analyze ticker." });
