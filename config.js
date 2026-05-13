@@ -5,4 +5,4 @@
   const API_BASE_URL = "https://your-render-service-name.onrender.com";
 */
 
-const API_BASE_URL = "https://investment-analyzer-backend.onrender.com";
+const API_BASE_URL = "https://anvestment-analyzer-backend.onrender.com";
